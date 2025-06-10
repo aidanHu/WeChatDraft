@@ -216,6 +216,170 @@ def create_draft_api(access_token, articles_data, appid_for_log="", proxies=None
         print("  " + log_prefix + "无法解析草稿创建响应: " + str(response_text))
         return None
 
+def convert_text_to_html(text_content):
+    """将纯文本内容转换为HTML格式"""
+    if not text_content:
+        return ""
+    
+    # 将换行符转换为<br>标签
+    html_content = text_content.replace('\n', '<br>')
+    # 替换多个连续空格为&nbsp;
+    html_content = re.sub(r' {2,}', lambda m: '&nbsp;' * len(m.group()), html_content)
+    # 添加基本的段落标签
+    html_content = f'<p>{html_content}</p>'
+    
+    return html_content
+
+def process_single_picture_folder(folder_path, article_config, access_token, proxies=None):
+    """处理单个图片消息文件夹"""
+    appid_for_log = article_config.get('appid', 'N/A')
+    log_prefix = f"(AppID: {appid_for_log}) "
+    
+    print(f"  处理图片消息文件夹: {folder_path}")
+    
+    # 获取文件夹名作为标题
+    folder_name = os.path.basename(folder_path)
+    
+    # 查找txt文件
+    txt_files = [f for f in os.listdir(folder_path) if f.lower().endswith('.txt')]
+    if not txt_files:
+        print("    错误：未找到txt文件，跳过此文件夹")
+        return False
+    
+    if len(txt_files) > 1:
+        print(f"    警告：找到多个txt文件，使用第一个：{txt_files[0]}")
+    
+    txt_file_path = os.path.join(folder_path, txt_files[0])
+    
+    # 读取txt文件内容
+    try:
+        with open(txt_file_path, 'r', encoding='utf-8') as f:
+            text_content = f.read().strip()
+    except Exception as e:
+        print(f"    错误：读取txt文件失败 {txt_file_path}: {e}")
+        return False
+    
+    # 将txt内容转换为HTML格式
+    html_content = convert_text_to_html(text_content)
+    
+    # 查找所有图片文件，按文件名数字排序
+    image_files = []
+    for f in os.listdir(folder_path):
+        if f.lower().endswith(('.jpg', '.jpeg', '.png', '.gif')):
+            image_files.append(f)
+    
+    if not image_files:
+        print("    错误：未找到图片文件，跳过此文件夹")
+        return False
+    
+    # 按文件名中的数字排序
+    def extract_number(filename):
+        numbers = re.findall(r'\d+', filename)
+        return int(numbers[0]) if numbers else float('inf')
+    
+    image_files.sort(key=extract_number)
+    print(f"    找到 {len(image_files)} 个图片文件，按顺序处理...")
+    
+    # 上传所有图片
+    uploaded_images = []
+    for i, image_file in enumerate(image_files):
+        image_path = os.path.join(folder_path, image_file)
+        print(f"      上传第 {i+1} 个图片: {image_file}")
+        
+        upload_result = upload_permanent_material(access_token, image_path, 'image', appid_for_log, proxies=proxies)
+        if upload_result and upload_result.get("media_id"):
+            uploaded_images.append({
+                "image_media_id": upload_result["media_id"]
+            })
+            print(f"        上传成功，Media ID: {upload_result['media_id']}")
+        else:
+            print(f"        上传失败: {image_file}")
+            return False
+    
+    if not uploaded_images:
+        print("    错误：没有成功上传的图片")
+        return False
+    
+    # 构建图片消息API数据
+    is_comment_enabled = article_config.get('is_comment_enabled', False)
+    comment_permission = article_config.get('comment_permission', '所有人')
+    need_open_comment = int(1 if is_comment_enabled else 0)
+    only_fans_can_comment = int(1 if comment_permission == '仅粉丝' else 0)
+    
+    # 获取txt文件名作为标题（去掉扩展名）
+    title = os.path.splitext(txt_files[0])[0]
+    
+    articles_data = {
+        "articles": [{
+            "article_type": "newspic",
+            "title": title,
+            "content": html_content,
+            "need_open_comment": need_open_comment,
+            "only_fans_can_comment": only_fans_can_comment,
+            "image_info": {
+                "image_list": uploaded_images
+            }
+        }]
+    }
+    
+    print("    创建图片消息草稿...")
+    success = create_draft_api(access_token, articles_data, appid_for_log, proxies=proxies)
+    return success
+
+def process_picture_message_folders(articles_folder_path, article_config, access_token, num_to_publish, proxies=None):
+    """处理图片消息文件夹"""
+    print(f"  开始处理图片消息文件夹模式...")
+    
+    # 获取所有子文件夹
+    try:
+        subfolders = [f for f in os.listdir(articles_folder_path) 
+                     if os.path.isdir(os.path.join(articles_folder_path, f)) 
+                     and f != ARCHIVED_FOLDER_NAME]
+        subfolders.sort()  # 按名称排序
+    except Exception as e:
+        print(f"    错误：读取图片消息目录失败: {e}")
+        return 0
+    
+    if not subfolders:
+        print("    未找到图片消息子文件夹")
+        return 0
+    
+    processed_count = 0
+    
+    for i, subfolder in enumerate(subfolders):
+        if processed_count >= num_to_publish:
+            print(f"    已达存稿上限 ({num_to_publish})")
+            break
+            
+        subfolder_path = os.path.join(articles_folder_path, subfolder)
+        print(f"\n    [{i+1}/{len(subfolders)}] 处理子文件夹: {subfolder}")
+        
+        if process_single_picture_folder(subfolder_path, article_config, access_token, proxies=proxies):
+            print(f"      图片消息 '{subfolder}' 创建成功")
+            
+            # 移动整个文件夹到已发内容
+            archived_dir = os.path.join(articles_folder_path, ARCHIVED_FOLDER_NAME)
+            if not os.path.exists(archived_dir):
+                try:
+                    os.makedirs(archived_dir)
+                    print(f"      创建文件夹: {archived_dir}")
+                except OSError as e:
+                    print(f"      错误：创建已发内容文件夹失败: {e}")
+                    continue
+            
+            destination_path = os.path.join(archived_dir, subfolder)
+            print(f"      准备移动文件夹: '{subfolder_path}' -> '{destination_path}'")
+            try:
+                shutil.move(subfolder_path, destination_path)
+                print("      文件夹已移动")
+                processed_count += 1
+            except Exception as e:
+                print(f"      移动文件夹失败: {e}")
+        else:
+            print(f"      处理图片消息失败: {subfolder}")
+    
+    return processed_count
+
 def process_single_article(article_config, access_token, proxies=None):
     print("  处理文章: " + str(article_config['html_file_full_path']))
     appid_for_log = article_config.get('appid', 'N/A')
@@ -297,6 +461,7 @@ def generate_excel_template_if_not_exists(filename=EXCEL_TEMPLATE_NAME):
         '作者名称': ['示例作者张三', '测试小编'],
         '存稿文件路径': ['/path/to/your/account1/articles', 'C:\\Users\\YourName\\Documents\\Account2Articles'],
         '存稿数量': [2, 1],
+        '消息类型': ['图文消息', '图片消息'],
         '是否开始原创': ['是', '否'],
         '是否开启评论': ['是', '否'],
         '评论权限': ['所有人', '仅粉丝'],
@@ -310,6 +475,10 @@ def generate_excel_template_if_not_exists(filename=EXCEL_TEMPLATE_NAME):
         df_template.to_excel(filename, index=False)
         print("已生成Excel配置文件模板: '" + str(filename) + "'")
         print(f"请根据实际情况修改此文件中的内容，然后重新运行脚本并输入此文件名。")
+        print("注意：")
+        print("  - 消息类型：填写'图文消息'或'图片消息'")
+        print("  - 图文消息：存稿路径中放置.html或.txt文件")
+        print("  - 图片消息：存稿路径中放置包含图片和txt文件的子文件夹")
     except Exception as e:
         print("生成Excel模板 '" + str(filename) + "' 失败: " + str(e))
 
@@ -336,7 +505,7 @@ def main():
         print("读取Excel文件时发生错误: " + str(e))
         return
 
-    required_columns = ['appID', 'app secret', '作者名称', '存稿文件路径', '存稿数量', '是否开始原创',
+    required_columns = ['appID', 'app secret', '作者名称', '存稿文件路径', '存稿数量', '消息类型', '是否开始原创',
                         '是否开启评论', '评论权限', '代理IP', '代理端口', '代理用户名', '代理密码'] 
     missing_cols = [col for col in required_columns if col not in df.columns]
     if missing_cols:
@@ -365,6 +534,8 @@ def main():
             print("  警告: 账号 '" + str(account_name) + "' 的存稿数量 '" + str(row['存稿数量']) + "' 不是有效数字，将视为0处理。")
             num_to_publish = 0
             
+        message_type = str(row.get('消息类型', '图文消息')).strip()
+        
         is_original_str_from_excel = str(row['是否开始原创']).strip().lower()
         is_original_bool = is_original_str_from_excel in ['是', 'true', '1', 'yes']
 
@@ -396,7 +567,7 @@ def main():
                     print("  警告: 代理端口 '" + str(proxy_port) + "' 不是有效数字，此账号代理将不被使用。")
         
         print("\n================== " + str(account_name) + " (AppID: " + str(appid) + ") ==================")
-        print("  作者: " + str(author_name) + ", 原创: " + str(is_original_bool) + ", 评论: " + str(is_comment_bool) + ", 代理: " + ('启用' if current_proxies else '禁用'))
+        print("  作者: " + str(author_name) + ", 消息类型: " + str(message_type) + ", 原创: " + str(is_original_bool) + ", 评论: " + str(is_comment_bool) + ", 代理: " + ('启用' if current_proxies else '禁用'))
         print("  路径: " + str(articles_folder_path) + ", 处理数量: " + str(num_to_publish))
         print("====================================================================")
 
@@ -409,55 +580,73 @@ def main():
             continue
         print("  成功获取 " + str(account_name) + " 的Token。")
 
-        try: article_files = sorted([f for f in os.listdir(articles_folder_path) if os.path.isfile(os.path.join(articles_folder_path, f)) and (f.lower().endswith('.html') or f.lower().endswith('.txt'))])
-        except Exception as e: 
-            print("  错误：读取存稿目录 '" + str(articles_folder_path) + "' 失败: " + str(e) + "。跳过。") 
-            continue
-        if not article_files: 
-            print("  目录 '" + str(articles_folder_path) + "' 无 .html/.txt 文件。") 
-            continue
         if num_to_publish == 0: 
             print("  存稿数量为0，跳过文件处理。") 
             continue
-            
-        articles_processed_count = 0
-        for i, file_name in enumerate(article_files):
-            if articles_processed_count >= num_to_publish: 
-                print("  已达存稿上限 (" + str(num_to_publish) + ")。") 
-                break
-            full_file_path = os.path.join(articles_folder_path, file_name)
-            print("\n  [" + str(i+1) + "/" + str(len(article_files)) + "] 处理文件: " + str(file_name))
 
+        # 根据消息类型选择处理方式
+        articles_processed_count = 0
+        
+        if message_type == '图片消息':
+            # 图片消息模式：处理文件夹结构
             article_config_data = {
                 'appid': appid, 
                 'author': author_name, 
                 'is_original': is_original_bool,
                 'is_comment_enabled': is_comment_bool,
                 'comment_permission': comment_permission,
-                'content_source_url': "", 
-                'html_file_full_path': full_file_path
             }
-            if process_single_article(article_config_data, access_token, proxies=current_proxies):
-                print("    文章 '" + str(file_name) + "' API调用成功。")
-                archived_dir = os.path.join(articles_folder_path, ARCHIVED_FOLDER_NAME)
-                if not os.path.exists(archived_dir): 
+            articles_processed_count = process_picture_message_folders(
+                articles_folder_path, article_config_data, access_token, num_to_publish, proxies=current_proxies
+            )
+        else:
+            # 图文消息模式：处理单个文件
+            try: 
+                article_files = sorted([f for f in os.listdir(articles_folder_path) if os.path.isfile(os.path.join(articles_folder_path, f)) and (f.lower().endswith('.html') or f.lower().endswith('.txt'))])
+            except Exception as e: 
+                print("  错误：读取存稿目录 '" + str(articles_folder_path) + "' 失败: " + str(e) + "。跳过。") 
+                continue
+            if not article_files: 
+                print("  目录 '" + str(articles_folder_path) + "' 无 .html/.txt 文件。") 
+                continue
+                
+            for i, file_name in enumerate(article_files):
+                if articles_processed_count >= num_to_publish: 
+                    print("  已达存稿上限 (" + str(num_to_publish) + ")。") 
+                    break
+                full_file_path = os.path.join(articles_folder_path, file_name)
+                print("\n  [" + str(i+1) + "/" + str(len(article_files)) + "] 处理文件: " + str(file_name))
+
+                article_config_data = {
+                    'appid': appid, 
+                    'author': author_name, 
+                    'is_original': is_original_bool,
+                    'is_comment_enabled': is_comment_bool,
+                    'comment_permission': comment_permission,
+                    'content_source_url': "", 
+                    'html_file_full_path': full_file_path
+                }
+                if process_single_article(article_config_data, access_token, proxies=current_proxies):
+                    print("    文章 '" + str(file_name) + "' API调用成功。")
+                    archived_dir = os.path.join(articles_folder_path, ARCHIVED_FOLDER_NAME)
+                    if not os.path.exists(archived_dir): 
+                        try: 
+                            os.makedirs(archived_dir)
+                            print("    创建文件夹: " + str(archived_dir))
+                        except OSError as e: 
+                            error_message = "    错误：创建" + "已发内容" + "文件夹 '" + str(archived_dir) + "' 失败: " + str(e) + "。文件不移动。"
+                            print(error_message)
+                            continue
+                    destination_path = os.path.join(archived_dir, file_name)
+                    print("    准备移动: '" + str(full_file_path) + "' -> '" + str(destination_path) + "'")
                     try: 
-                        os.makedirs(archived_dir)
-                        print("    创建文件夹: " + str(archived_dir))
-                    except OSError as e: 
-                        error_message = "    错误：创建" + "“已发内容”" + "文件夹 '" + str(archived_dir) + "' 失败: " + str(e) + "。文件不移动。"
-                        print(error_message)
-                        continue
-                destination_path = os.path.join(archived_dir, file_name)
-                print("    准备移动: '" + str(full_file_path) + "' -> '" + str(destination_path) + "'")
-                try: 
-                    shutil.move(full_file_path, destination_path)
-                    print("    文件已移动.")
-                except Exception as e: 
-                    print("    移动文件失败: " + str(e))
-                articles_processed_count += 1
-            else: 
-                print("    处理或创建草稿失败: " + str(file_name))
+                        shutil.move(full_file_path, destination_path)
+                        print("    文件已移动.")
+                    except Exception as e: 
+                        print("    移动文件失败: " + str(e))
+                    articles_processed_count += 1
+                else: 
+                    print("    处理或创建草稿失败: " + str(file_name))
         
         if articles_processed_count == 0 and num_to_publish > 0: 
             print("  警告: " + str(account_name) + " 成功处理0篇 (目标: " + str(num_to_publish) + ").")

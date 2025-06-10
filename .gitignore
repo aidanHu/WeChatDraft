@@ -2,3 +2,4 @@ wechat_config_template.xlsx
 wechat_config.xlsx
 .DS_Store
 ~$wechat_config_template.xlsx
+__pycache__/wechat_draft_creator.cpython-310.pyc
