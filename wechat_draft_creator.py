@@ -258,20 +258,25 @@ def process_single_article(article_config, access_token, proxies=None):
                     print("    删除临时封面文件 " + str(temp_cover_filename) + " 失败: " + str(e))
     if not actual_thumb_media_id: print("    警告: 未能准备封面图。API可能拒绝无封面草稿。")
     
-    # --- 调试原创状态 --- 
     is_original_for_api = 1 if article_config.get('is_original', False) else 0
-    print("    调试日志: article_config中的is_original值: " + str(article_config.get('is_original')) + ", 将用于API的is_original值: " + str(is_original_for_api))
-    # --- 调试结束 ---
+
+    is_comment_enabled = article_config.get('is_comment_enabled', False)
+    comment_permission = article_config.get('comment_permission', '所有人')
+    need_open_comment = int(1 if is_comment_enabled else 0)
+    only_fans_can_comment = int(1 if comment_permission == '仅粉丝' else 0)
 
     print("    步骤5: 创建草稿...")
     article_title = os.path.splitext(os.path.basename(current_html_file_path))[0]
     articles_data = {
         "articles": [{
+            "article_type": "news",  # 明确指定为图文消息
             "title": article_title,
             "author": article_config.get('author', '佚名'),
             "content": final_html_content_for_api,
             "thumb_media_id": actual_thumb_media_id,
-            "is_original": 1 # 强制为1测试
+            "need_open_comment": need_open_comment,
+            "only_fans_can_comment": only_fans_can_comment,
+            "is_original": is_original_for_api
         }]
     }
     success = create_draft_api(access_token, articles_data, appid_for_log, proxies=proxies)
@@ -293,6 +298,8 @@ def generate_excel_template_if_not_exists(filename=EXCEL_TEMPLATE_NAME):
         '存稿文件路径': ['/path/to/your/account1/articles', 'C:\\Users\\YourName\\Documents\\Account2Articles'],
         '存稿数量': [2, 1],
         '是否开始原创': ['是', '否'],
+        '是否开启评论': ['是', '否'],
+        '评论权限': ['所有人', '仅粉丝'],
         '代理IP': ['', '127.0.0.1'],
         '代理端口': ['', '1080'],
         '代理用户名': ['', 'proxyuser'],
@@ -330,7 +337,7 @@ def main():
         return
 
     required_columns = ['appID', 'app secret', '作者名称', '存稿文件路径', '存稿数量', '是否开始原创',
-                        '代理IP', '代理端口', '代理用户名', '代理密码'] 
+                        '是否开启评论', '评论权限', '代理IP', '代理端口', '代理用户名', '代理密码'] 
     missing_cols = [col for col in required_columns if col not in df.columns]
     if missing_cols:
         print("错误：Excel文件中缺少以下列: " + ", ".join(missing_cols) + "。请检查Excel列名。")
@@ -360,7 +367,11 @@ def main():
             
         is_original_str_from_excel = str(row['是否开始原创']).strip().lower()
         is_original_bool = is_original_str_from_excel in ['是', 'true', '1', 'yes']
-        print("  调试日志: 从Excel读取的'是否开始原创'原始值: '" + str(row['是否开始原创']) + "', 解析为字符串: '" + is_original_str_from_excel + "', 最终布尔值: " + str(is_original_bool))
+
+        comment_str_from_excel = str(row['是否开启评论']).strip().lower()
+        is_comment_bool = comment_str_from_excel in ['是', 'true', '1', 'yes']
+
+        comment_permission = str(row['评论权限']).strip()
 
         proxy_ip = str(row.get('代理IP', '')).strip()
         proxy_port = str(row.get('代理端口', '')).strip()
@@ -385,7 +396,7 @@ def main():
                     print("  警告: 代理端口 '" + str(proxy_port) + "' 不是有效数字，此账号代理将不被使用。")
         
         print("\n================== " + str(account_name) + " (AppID: " + str(appid) + ") ==================")
-        print("  作者: " + str(author_name) + ", 原创: " + str(is_original_bool) + ", 代理: " + ('启用' if current_proxies else '禁用'))
+        print("  作者: " + str(author_name) + ", 原创: " + str(is_original_bool) + ", 评论: " + str(is_comment_bool) + ", 代理: " + ('启用' if current_proxies else '禁用'))
         print("  路径: " + str(articles_folder_path) + ", 处理数量: " + str(num_to_publish))
         print("====================================================================")
 
@@ -421,6 +432,8 @@ def main():
                 'appid': appid, 
                 'author': author_name, 
                 'is_original': is_original_bool,
+                'is_comment_enabled': is_comment_bool,
+                'comment_permission': comment_permission,
                 'content_source_url': "", 
                 'html_file_full_path': full_file_path
             }
