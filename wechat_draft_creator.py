@@ -15,12 +15,26 @@ except ImportError as e:
     print("请尝试运行 'pip install pandas openpyxl' 来安装它以启用此功能。")
 try:
     from premailer import Premailer
+    # 强制导入相关依赖
+    import premailer.premailer
+    import cssutils
+    import cssselect
     PREMAILER_AVAILABLE = True
-except ImportError: PREMAILER_AVAILABLE = False
+except ImportError as e: 
+    PREMAILER_AVAILABLE = False
+    print(f"Premailer导入失败: {e}")
+
 try:
     from bs4 import BeautifulSoup
+    # 强制导入lxml解析器
+    import lxml
+    import lxml.etree
+    import lxml.html
+    import bs4.builder._lxml
     BS4_AVAILABLE = True
-except ImportError: BS4_AVAILABLE = False
+except ImportError as e: 
+    BS4_AVAILABLE = False
+    print(f"BeautifulSoup/lxml导入失败: {e}")
 
 
 # ===================== GUI 相关代码 =====================
