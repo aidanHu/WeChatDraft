@@ -8,9 +8,10 @@ from datetime import datetime
 try:
     import pandas as pd
     PANDAS_AVAILABLE = True
-except ImportError:
+except ImportError as e:
     PANDAS_AVAILABLE = False
-    print("警告: pandas 库未找到。无法从Excel读取配置或生成模板。")
+    print("错误: pandas 库未找到或导入失败。无法从Excel读取配置或生成模板。")
+    print(f"详细错误: {e}")
     print("请尝试运行 'pip install pandas openpyxl' 来安装它以启用此功能。")
 try:
     from premailer import Premailer
@@ -20,10 +21,7 @@ try:
     from bs4 import BeautifulSoup
     BS4_AVAILABLE = True
 except ImportError: BS4_AVAILABLE = False
-try:
-    import socks
-    SOCKS_AVAILABLE = True
-except ImportError: SOCKS_AVAILABLE = False
+
 
 # ===================== GUI 相关代码 =====================
 try:
@@ -149,8 +147,8 @@ def set_log_callback(callback):
 
 def _make_request(method, url, **kwargs):
     """统一处理 requests 请求，加入 proxies 参数"""
-    # proxies 参数应形如: {'http': 'socks5h://user:pass@host:port', 'https': 'socks5h://user:pass@host:port'}
-    # 或者 {'http': 'socks5h://host:port', 'https': 'socks5h://host:port'}
+    # proxies 参数应形如: {'http': 'http://user:pass@host:port', 'https': 'http://user:pass@host:port'}
+    # 或者 {'http': 'http://host:port', 'https': 'http://host:port'}
     # kwargs 中可以包含 proxies, timeout, stream, files, data, headers 等
     
     # 确保超时设置
@@ -339,9 +337,26 @@ def replace_external_images_in_html(html_content, access_token, appid_for_log=""
 
     if image_counter > 0:
         log_message("    共找到" + str(image_counter) + "个外部图片链接，成功处理了" + str(processed_image_count) + "个。")
-    return str(soup)
+    
+    # 修复BeautifulSoup的HTML输出格式问题
+    # 使用soup.body.decode_contents()保留body内的内容，避免添加html/body标签
+    try:
+        if soup.body:
+            result_html = soup.body.decode_contents()
+        else:
+            # 如果没有body标签，尝试获取所有内容
+            result_html = str(soup)
+            # 移除lxml自动添加的html和body标签
+            if result_html.startswith('<html><body>') and result_html.endswith('</body></html>'):
+                result_html = result_html[12:-14]  # 移除<html><body>和</body></html>
+        
+        log_message(f"    HTML处理完成，输出长度: {len(result_html)}")
+        return result_html
+    except Exception as e:
+        log_message(f"    HTML格式化失败: {e}，使用原始HTML")
+        return html_content
 
-def create_draft_api(access_token, articles_data, appid_for_log="", proxies=None):
+def create_draft_api(access_token, articles_data, appid_for_log="", proxies=None, show_content=True):
     url = f"{BASE_URL}/draft/add?access_token={access_token}"
     headers = {"Content-Type": "application/json"}
     log_prefix = f"(AppID: {appid_for_log}) " if appid_for_log else ""
@@ -353,6 +368,36 @@ def create_draft_api(access_token, articles_data, appid_for_log="", proxies=None
     log_message(f"    作者: {article.get('author', 'N/A')}")
     log_message(f"    封面Media ID: {article.get('thumb_media_id', 'N/A')}")
     log_message(f"    内容长度: {len(article.get('content', ''))}")
+    
+    # 调试：输出部分HTML内容用于分析（仅图文消息）
+    if show_content:
+        content = article.get('content', '')
+        if content:
+            log_message(f"    内容开头200字符: {content[:200]}...")
+            log_message(f"    内容结尾200字符: ...{content[-200:]}")
+            
+            # 检查是否包含可能有问题的标签
+            problematic_patterns = [
+                r'<script[^>]*>',
+                r'<style[^>]*>',
+                r'<iframe[^>]*>',
+                r'<object[^>]*>',
+                r'<embed[^>]*>',
+                r'<form[^>]*>',
+                r'<input[^>]*>',
+                r'<button[^>]*>',
+                r'<link[^>]*>',
+                r'<meta[^>]*>',
+                r'on\w+\s*=',
+                r'javascript:',
+                r'<mp-[^>]*>',
+                r'data-miniprogram-[^=]*='
+            ]
+            
+            for pattern in problematic_patterns:
+                matches = re.findall(pattern, content, re.IGNORECASE)
+                if matches:
+                    log_message(f"    发现可能有问题的标签/属性: {pattern} -> {matches[:3]}")
     
     try:
         response = _make_request("post", url, headers=headers, data=json.dumps(articles_data, ensure_ascii=False).encode('utf-8'), proxies=proxies)
@@ -387,7 +432,8 @@ def create_draft_api(access_token, articles_data, appid_for_log="", proxies=None
                 45004: "描述字段超过限制",
                 45007: "语音播放时间超过限制",
                 45008: "图文消息超过限制",
-                45009: "接口调用超过限制"
+                45009: "接口调用超过限制",
+                45166: "内容格式无效 - 可能包含不支持的HTML标签、图片格式问题或内容审核不通过"
             }
             
             if errcode in error_explanations:
@@ -397,7 +443,14 @@ def create_draft_api(access_token, articles_data, appid_for_log="", proxies=None
                 log_message("  " + log_prefix + "建议: 检查封面图片是否成功上传，或尝试使用其他图片")
             elif errcode == 42001:
                 log_message("  " + log_prefix + "建议: access_token已过期，需要重新获取")
-                
+            elif errcode == 45166:
+                log_message("  " + log_prefix + "建议: 检查以下问题:")
+                log_message("  " + log_prefix + "  1) HTML内容是否包含不支持的标签(如script、style等)")
+                log_message("  " + log_prefix + "  2) 图片链接是否都来自微信域名")
+                log_message("  " + log_prefix + "  3) 图片宽高比例是否合适")
+                log_message("  " + log_prefix + "  4) 内容是否包含敏感词汇")
+                log_message("  " + log_prefix + "  5) 检查是否有小程序相关标签格式错误")
+            
             return None
             
     except requests.exceptions.RequestException as e:
@@ -408,19 +461,100 @@ def create_draft_api(access_token, articles_data, appid_for_log="", proxies=None
         log_message("  " + log_prefix + "无法解析草稿创建响应: " + str(response_text))
         return None
 
-def convert_text_to_html(text_content):
-    """将纯文本内容转换为HTML格式"""
+
+def clean_and_normalize_text(text_content):
+    """严格清理和规范化文本内容，移除所有可能导致45166错误的字符"""
     if not text_content:
         return ""
     
-    # 将换行符转换为<br>标签
-    html_content = text_content.replace('\n', '<br>')
-    # 替换多个连续空格为&nbsp;
-    html_content = re.sub(r' {2,}', lambda m: '&nbsp;' * len(m.group()), html_content)
-    # 添加基本的段落标签
-    html_content = f'<p>{html_content}</p>'
+    import unicodedata
+    import re
     
-    return html_content
+    # 步骤1: 基础清理
+    cleaned_text = text_content.strip()
+    
+    # 移除所有制表符和特殊空白字符（更全面）
+    cleaned_text = re.sub(r'[\t\r\f\v\u00A0]', ' ', cleaned_text)  # 将tab和不间断空格转换为普通空格
+    cleaned_text = re.sub(r' +', ' ', cleaned_text)  # 合并多个空格为单个空格
+    
+    # 步骤2: Unicode规范化
+    cleaned_text = unicodedata.normalize('NFC', cleaned_text)
+    
+    # 步骤3: 移除变体选择符和零宽字符
+    cleaned_text = re.sub(r'[\uFE00-\uFE0F\u200B-\u200D\uFEFF\u2060]', '', cleaned_text)
+    
+    # 步骤4: 替换危险的Unicode字符
+    char_replacements = {
+        # 空格和分隔符
+        '\u2028': '\n',      # 行分隔符
+        '\u2029': '\n\n',    # 段落分隔符
+        '\u00A0': ' ',       # 不间断空格
+        '\u2060': '',        # 零宽无断空格
+        
+        # 箭头和符号（确定导致45166错误的字符）
+        '\u2192': ' -> ',    # 右箭头 →
+        '\u2190': ' <- ',    # 左箭头 ←
+        '\u2191': ' ^ ',     # 上箭头 ↑
+        '\u2193': ' v ',     # 下箭头 ↓
+        
+        # 破折号（确定导致45166错误的字符）
+        '\u2014': '-',       # EM DASH —
+        '\u2013': '-',       # EN DASH –
+        '\u2026': '...',     # 省略号 …
+        
+        # 引号规范化
+        '\u201C': '"',       # 左双引号 "
+        '\u201D': '"',       # 右双引号 "
+        '\u2018': "'",       # 左单引号 '
+        '\u2019': "'",       # 右单引号 '
+        
+        # 其他符号
+        '\u2022': '•',       # 项目符号 •
+        '\u2023': '►',       # 三角项目符号
+        '\u25B6': '►',       # 播放符号 ▶
+        
+        # 数学符号
+        '\u00D7': 'x',       # 乘号 ×
+        '\u00F7': '/',       # 除号 ÷
+        '\u2212': '-',       # 减号 −
+        
+        # 从文件分析中发现的额外问题字符
+        '\u26A0': '⚠',       # 警告符号 ⚠ 
+        '\u2705': '✓',       # 白色重复选中标记 ✅
+        '\u2728': '✨',       # 闪亮 ✨
+        '\u274C': '✗',       # 叉号 ❌
+        '\uFE0F': '',        # 变体选择符-16（移除）
+    }
+    
+    for old_char, new_char in char_replacements.items():
+        cleaned_text = cleaned_text.replace(old_char, new_char)
+    
+    return cleaned_text
+
+def convert_text_to_plain_for_pic_message(text_content):
+    """将纯文本内容转换为图片消息格式（纯文本，不支持HTML）"""
+    if not text_content:
+        return ""
+    
+    # 清理和规范化文本内容
+    cleaned_text = clean_and_normalize_text(text_content)
+    
+    # 规范化确实有问题的emoji
+    emoji_map = {
+        '1⃣️': '1️⃣', '2⃣️': '2️⃣', '3⃣️': '3️⃣', '4⃣️': '4️⃣', '5⃣️': '5️⃣',
+        '6⃣️': '6️⃣', '7⃣️': '7️⃣', '8⃣️': '8️⃣', '9⃣️': '9️⃣',
+        '[赞R]': '👍', '[强]': '💪', '[握手]': '🤝',
+        '➡️': '->', '⬅️': '<-', '⬆️': '^', '⬇️': 'v',
+    }
+    
+    # 应用emoji映射
+    for old_emoji, new_emoji in emoji_map.items():
+        cleaned_text = cleaned_text.replace(old_emoji, new_emoji)
+    
+    # 图片消息使用纯文本格式
+    plain_content = cleaned_text.strip()
+    
+    return plain_content
 
 def process_single_picture_folder(folder_path, article_config, access_token, proxies=None):
     """处理单个图片消息文件夹"""
@@ -451,8 +585,8 @@ def process_single_picture_folder(folder_path, article_config, access_token, pro
         log_message(f"    错误：读取txt文件失败 {txt_file_path}: {e}")
         return False
     
-    # 将txt内容转换为HTML格式
-    html_content = convert_text_to_html(text_content)
+    # 将txt内容转换为图片消息纯文本格式
+    content = convert_text_to_plain_for_pic_message(text_content)
     
     # 查找所有图片文件，按文件名数字排序
     image_files = []
@@ -511,7 +645,7 @@ def process_single_picture_folder(folder_path, article_config, access_token, pro
         "articles": [{
             "article_type": "newspic",
             "title": title,
-            "content": html_content,
+            "content": content,
             "need_open_comment": need_open_comment,
             "only_fans_can_comment": only_fans_can_comment,
             "image_info": {
@@ -521,7 +655,7 @@ def process_single_picture_folder(folder_path, article_config, access_token, pro
     }
     
     log_message("    创建图片消息草稿...")
-    success = create_draft_api(access_token, articles_data, appid_for_log, proxies=proxies)
+    success = create_draft_api(access_token, articles_data, appid_for_log, proxies=proxies, show_content=False)
     return success
 
 def process_picture_message_folders(articles_folder_path, article_config, access_token, num_to_publish, proxies=None):
@@ -594,19 +728,160 @@ def process_single_article(article_config, access_token, proxies=None):
 
     log_message("    步骤1: Premailer CSS内联优化...")
     optimized_html_content = optimize_html_with_inline_styles(raw_html_content)
+    log_message(f"    优化后HTML长度: {len(optimized_html_content)}")
+    
     log_message("    步骤2: 替换正文外部图片链接...")
     html_with_wechat_images = replace_external_images_in_html(optimized_html_content, access_token, appid_for_log, current_html_file_path, proxies=proxies)
+    log_message(f"    图片处理后HTML长度: {len(html_with_wechat_images)}")
+    
+    # 检查图片处理后是否还有img标签
+    img_count_after = len(re.findall(r'<img[^>]*>', html_with_wechat_images, re.IGNORECASE))
+    log_message(f"    图片处理后剩余图片数量: {img_count_after}")
+    
     log_message("    步骤3: 正则清理HTML...")
     cleaned_html = html_with_wechat_images
-    cleaned_html = re.sub(r'<p\b[^>]*>\s*(?:&nbsp;|<br\s*/?>|\s)*\s*</p>', '', cleaned_html, flags=re.IGNORECASE | re.DOTALL)
-    cleaned_html = re.sub(r'<p\b[^>]*>\s*<span\b[^>]*>\s*<br\b[^>]*>\s*</span>\s*</p>', '', cleaned_html, flags=re.IGNORECASE | re.DOTALL) 
-    cleaned_html = re.sub(r'(\s*<br\s*/?>\s*){2,}', '<br>\n', cleaned_html, flags=re.IGNORECASE)
-    cleaned_html = re.sub(r'>\s+<', '><', cleaned_html)
+    
+    # 移除危险的HTML标签
+    cleaned_html = re.sub(r'<script[^>]*>.*?</script>', '', cleaned_html, flags=re.IGNORECASE | re.DOTALL)
+    cleaned_html = re.sub(r'<style[^>]*>.*?</style>', '', cleaned_html, flags=re.IGNORECASE | re.DOTALL)
+    cleaned_html = re.sub(r'<link[^>]*>', '', cleaned_html, flags=re.IGNORECASE)
+    cleaned_html = re.sub(r'<meta[^>]*>', '', cleaned_html, flags=re.IGNORECASE)
+    cleaned_html = re.sub(r'<iframe[^>]*>.*?</iframe>', '', cleaned_html, flags=re.IGNORECASE | re.DOTALL)
+    cleaned_html = re.sub(r'<object[^>]*>.*?</object>', '', cleaned_html, flags=re.IGNORECASE | re.DOTALL)
+    cleaned_html = re.sub(r'<embed[^>]*>', '', cleaned_html, flags=re.IGNORECASE)
+    cleaned_html = re.sub(r'<form[^>]*>.*?</form>', '', cleaned_html, flags=re.IGNORECASE | re.DOTALL)
+    cleaned_html = re.sub(r'<input[^>]*>', '', cleaned_html, flags=re.IGNORECASE)
+    cleaned_html = re.sub(r'<button[^>]*>.*?</button>', '', cleaned_html, flags=re.IGNORECASE | re.DOTALL)
+    cleaned_html = re.sub(r'<select[^>]*>.*?</select>', '', cleaned_html, flags=re.IGNORECASE | re.DOTALL)
+    cleaned_html = re.sub(r'<textarea[^>]*>.*?</textarea>', '', cleaned_html, flags=re.IGNORECASE | re.DOTALL)
+    
+    # 移除小程序相关标签
+    cleaned_html = re.sub(r'<mp-[^>]*>.*?</mp-[^>]*>', '', cleaned_html, flags=re.IGNORECASE | re.DOTALL)
+    cleaned_html = re.sub(r'<mp-[^>]*>', '', cleaned_html, flags=re.IGNORECASE)
+    
+    # 清理小程序相关属性
+    cleaned_html = re.sub(r'\s*data-miniprogram-[^=]*=["\'][^"\']*["\']', '', cleaned_html, flags=re.IGNORECASE)
+    
+    # 清理事件处理器
+    cleaned_html = re.sub(r'\s*on\w+\s*=\s*["\'][^"\']*["\']', '', cleaned_html, flags=re.IGNORECASE)
+    
+    # 清理javascript:链接
+    cleaned_html = re.sub(r'href\s*=\s*["\']javascript:[^"\']*["\']', 'href="#"', cleaned_html, flags=re.IGNORECASE)
+    
+    # 清理其他可能有问题的属性
+    cleaned_html = re.sub(r'\s*contenteditable\s*=\s*["\'][^"\']*["\']', '', cleaned_html, flags=re.IGNORECASE)
+    cleaned_html = re.sub(r'\s*draggable\s*=\s*["\'][^"\']*["\']', '', cleaned_html, flags=re.IGNORECASE)
+    
+    # 只清理明显的空段落，保持原有换行格式
+    cleaned_html = re.sub(r'<p\b[^>]*>\s*(?:&nbsp;|\s)*\s*</p>', '', cleaned_html, flags=re.IGNORECASE | re.DOTALL)
+    # 移除过于激进的换行清理，保持原有HTML格式
+    
+    # 最终安全检查：移除任何剩余的危险元素
+    dangerous_tags = ['script', 'style', 'iframe', 'object', 'embed', 'form', 'input', 'button', 'select', 'textarea', 'link', 'meta']
+    for tag in dangerous_tags:
+        cleaned_html = re.sub(f'<{tag}[^>]*>.*?</{tag}>', '', cleaned_html, flags=re.IGNORECASE | re.DOTALL)
+        cleaned_html = re.sub(f'<{tag}[^>]*/?>', '', cleaned_html, flags=re.IGNORECASE)
+    
+    # 移除HTML5特殊属性和data-*属性（除了微信图片）
+    cleaned_html = re.sub(r'\s*data-(?!src)[^=]*=["\'][^"\']*["\']', '', cleaned_html, flags=re.IGNORECASE)
+    
+    # Emoji和特殊字符规范化
+    log_message("    步骤4: 规范化emoji和特殊字符...")
+    
+    # 定义emoji映射表（图文消息保守处理）
+    emoji_map = {
+        # 只处理确认有问题的数字emoji变体
+        '1⃣️': '1️⃣',
+        '2⃣️': '2️⃣', 
+        '3⃣️': '3️⃣',
+        '4⃣️': '4️⃣',
+        '5⃣️': '5️⃣',
+        '6⃣️': '6️⃣',
+        '7⃣️': '7️⃣',
+        '8⃣️': '8️⃣',
+        '9⃣️': '9️⃣',
+        
+        # 文本符号替换
+        '[赞R]': '👍',
+        '[强]': '💪',
+        '[握手]': '🤝',
+        
+        # 图文消息中保持大部分emoji原样，只替换确认有问题的
+        # 移除过度的emoji转换，保持原有样式
+    }
+    
+    # 记录处理前后的示例（在规范化前）
+    log_message(f"    规范化前示例: {repr(cleaned_html[:100])}")
+    
+    # 应用emoji映射
+    changes_made = []
+    for old_emoji, new_emoji in emoji_map.items():
+        if old_emoji in cleaned_html:
+            cleaned_html = cleaned_html.replace(old_emoji, new_emoji)
+            changes_made.append(f"{old_emoji} -> {new_emoji}")
+    
+    if changes_made:
+        log_message(f"    发现并替换的emoji: {', '.join(changes_made[:5])}")
+    else:
+        log_message("    未发现需要替换的emoji")
+    
+    # 将复杂的emoji转换为标准Unicode
+    import unicodedata
+    
+    def normalize_emoji(text):
+        # 规范化Unicode字符
+        normalized = unicodedata.normalize('NFC', text)
+        
+        # 移除变体选择符和零宽字符
+        normalized = re.sub(r'[\uFE00-\uFE0F\u200B-\u200D\uFEFF\u2060]', '', normalized)
+        
+        # 将问题字符转换为安全替代（图文消息保持HTML格式）
+        char_map = {
+            # 只处理确认会导致问题的字符，保持HTML格式
+            '\u00A0': '&nbsp;',  # 不间断空格 → HTML实体
+            '\u2060': '',        # 零宽无断空格
+            
+            # 箭头和符号
+            '\u2192': ' → ',     # 右箭头保持原样（HTML中一般没问题）
+            '\u2014': '—',       # EM DASH保持原样
+            '\u2013': '–',       # EN DASH保持原样
+            '\u2026': '…',       # 省略号保持原样
+            
+            # 引号保持原样（HTML中一般没问题）
+            '\u201C': '"',       # 左双引号
+            '\u201D': '"',       # 右双引号
+            '\u2018': "'",       # 左单引号
+            '\u2019': "'",       # 右单引号
+            
+            # 其他符号保持原样
+            '\u2022': '•',       # 项目符号
+            '\u2023': '▸',       # 三角项目符号
+            '\u25B6': '▶',       # 播放符号
+        }
+        
+        for old_char, new_char in char_map.items():
+            normalized = normalized.replace(old_char, new_char)
+            
+        return normalized
+    
+    cleaned_html = normalize_emoji(cleaned_html)
+    
+    # 记录处理后的示例
+    log_message(f"    规范化后示例: {repr(cleaned_html[:100])}")
+    
     final_html_content_for_api = cleaned_html
+    
+    # 最终检查图片数量
+    final_img_count = len(re.findall(r'<img[^>]*>', final_html_content_for_api, re.IGNORECASE))
+    log_message(f"    最终HTML长度: {len(final_html_content_for_api)}, 图片数量: {final_img_count}")
     log_message("    步骤4: 准备封面图...")
     
-    # 查找HTML中所有的图片URL
+    # 查找封面图片URL（优先使用原始HTML中的图片URL，避免微信防盗链问题）
     image_matches = re.findall(r'<img [^>]*src="([^"]+)"', raw_html_content, re.IGNORECASE)
+    
+    # 如果原始HTML中没有图片，再尝试使用处理过的HTML
+    if not image_matches:
+        image_matches = re.findall(r'<img [^>]*src="([^"]+)"', html_with_wechat_images, re.IGNORECASE)
     if not image_matches:
         log_message("    HTML中未找到任何图片")
         log_message("    警告: 微信API要求图文消息必须有封面图片。")
@@ -621,6 +896,16 @@ def process_single_article(article_config, access_token, proxies=None):
     # 依次尝试每张图片作为封面
     for i, cover_image_url in enumerate(image_matches):
         log_message(f"    尝试第 {i+1} 张图片作为封面: {cover_image_url[:80]}{'...' if len(cover_image_url) > 80 else ''}")
+        
+        # 检查是否已经是微信域名的图片
+        is_wechat_image = False
+        try:
+            domain = cover_image_url.split('//')[1].split('/')[0].lower() if '//' in cover_image_url else ''
+            if any(wx_domain in domain for wx_domain in WECHAT_IMG_DOMAINS):
+                is_wechat_image = True
+                log_message("    这是微信域名的图片，直接上传获取media_id...")
+        except (IndexError, AttributeError):
+            pass
         
         temp_cover_filename = f"temp_cover_{appid_for_log.replace('.', '_')}_{base_cover_html_filename}_{i}.jpg"
         
@@ -678,8 +963,6 @@ def process_single_article(article_config, access_token, proxies=None):
     else:
         log_message(f"    ✓ 成功设置封面图片，Media ID: {actual_thumb_media_id}")
     
-    is_original_for_api = 1 if article_config.get('is_original', False) else 0
-
     is_comment_enabled = article_config.get('is_comment_enabled', False)
     comment_permission = article_config.get('comment_permission', '所有人')
     need_open_comment = int(1 if is_comment_enabled else 0)
@@ -687,18 +970,39 @@ def process_single_article(article_config, access_token, proxies=None):
 
     log_message("    步骤5: 创建草稿...")
     article_title = os.path.splitext(os.path.basename(current_html_file_path))[0]
+    
+    # 生成摘要（取正文前54个字符，移除HTML标签）
+    plain_text = re.sub(r'<[^>]+>', '', final_html_content_for_api)
+    digest = plain_text[:54].strip() if plain_text else ""
+    
+    # 检查内容长度限制
+    content_byte_size = len(final_html_content_for_api.encode('utf-8'))
+    if content_byte_size > 1024 * 1024:  # 1MB
+        log_message(f"    警告: HTML内容大小 {content_byte_size} 字节，超过1MB限制")
+        
+    if len(final_html_content_for_api) > 20000:  # 2万字符
+        log_message(f"    警告: HTML内容长度 {len(final_html_content_for_api)} 字符，超过2万字符限制")
+    
     articles_data = {
         "articles": [{
             "article_type": "news",  # 明确指定为图文消息
             "title": article_title,
             "author": article_config.get('author', '佚名'),
+            "digest": digest,
             "content": final_html_content_for_api,
             "thumb_media_id": actual_thumb_media_id,
             "need_open_comment": need_open_comment,
-            "only_fans_can_comment": only_fans_can_comment,
-            "is_original": is_original_for_api
+            "only_fans_can_comment": only_fans_can_comment
         }]
     }
+    
+    log_message(f"    草稿数据摘要:")
+    log_message(f"      标题: {article_title}")
+    log_message(f"      作者: {article_config.get('author', '佚名')}")
+    log_message(f"      摘要: {digest[:30]}...")
+    log_message(f"      内容长度: {len(final_html_content_for_api)} 字符")
+    log_message(f"      内容大小: {content_byte_size} 字节")
+    log_message(f"      封面图片ID: {actual_thumb_media_id}")
     success = create_draft_api(access_token, articles_data, appid_for_log, proxies=proxies)
     return success
 
@@ -726,8 +1030,9 @@ def generate_excel_template_if_not_exists(filename=EXCEL_TEMPLATE_NAME):
         '代理用户名': ['', 'proxyuser'],
         '代理密码': ['', 'proxypass']
     }
-    df_template = pd.DataFrame(template_data)
     try:
+        import pandas as pd
+        df_template = pd.DataFrame(template_data)
         df_template.to_excel(filename, index=False)
         log_message("已生成Excel配置文件模板: '" + str(filename) + "'")
         log_message(f"请根据实际情况修改此文件中的内容，然后重新运行脚本并输入此文件名。")
@@ -773,7 +1078,13 @@ class ProcessingThread(QThread):
         
         self.emit_log("开始读取Excel配置文件...")
         
+        # 检查pandas是否可用
+        if not PANDAS_AVAILABLE:
+            self.emit_log("错误: pandas库不可用，无法读取Excel文件")
+            return
+        
         try:
+            import pandas as pd
             df = pd.read_excel(self.excel_file_path, sheet_name=0, dtype=str).fillna('')
             self.emit_log(f"成功读取 {len(df)} 条账号配置")
         except Exception as e:
@@ -893,8 +1204,8 @@ class ProcessingThread(QThread):
                 int_proxy_port = int(proxy_port)
                 proxy_auth = f"{proxy_user}:{proxy_pass}@" if proxy_user and proxy_pass else ""
                 return {
-                    "http": f"socks5h://{proxy_auth}{proxy_ip}:{int_proxy_port}",
-                    "https": f"socks5h://{proxy_auth}{proxy_ip}:{int_proxy_port}"
+                    "http": f"http://{proxy_auth}{proxy_ip}:{int_proxy_port}",
+                    "https": f"http://{proxy_auth}{proxy_ip}:{int_proxy_port}"
                 }
             except ValueError:
                 self.emit_log(f"代理端口配置错误: {proxy_port}")
